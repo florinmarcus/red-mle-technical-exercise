@@ -1,0 +1,11 @@
+data/red-store.sqlite
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.hypothesis/
+build/
+dist/
+*.egg-info/
+
+.idea/
