@@ -80,7 +80,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _check_python_version() -> int | None:
+    """Fail fast with a clear message instead of a confusing traceback.
+
+    The parser relies on ``str.removeprefix`` (3.9+) and PEP 604 union type
+    hints evaluated at runtime in older interpreters, so anything before 3.11
+    (the version this project targets) either breaks obscurely mid-ingest or
+    not at all until a rarely hit code path.
+    """
+    if sys.version_info < (3, 11):
+        version = ".".join(str(part) for part in sys.version_info[:3])
+        print(
+            f"red_store: requires Python 3.11 or later, but this is {version} "
+            f"({sys.executable}).",
+            file=sys.stderr,
+        )
+        return 1
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    version_error = _check_python_version()
+    if version_error is not None:
+        return version_error
     args = build_parser().parse_args(argv)
     if args.command == "schema":
         provisioning.create_schema(args.db)
