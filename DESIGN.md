@@ -12,7 +12,7 @@ flowchart LR
     A["Email report"] --> B["Keep the original report"]
     B --> C["Compare it with the known incident picture"]
     C --> D{"Enough evidence<br/>to decide?"}
-    D -->|Yes| E["Recommend existing, new,<br/>or related incident(s)"]
+    D -->|Yes| E["Recommend existing or new<br/>incident(s), plus links"]
     E --> F["Validate and add a<br/>traceable record"]
     D -->|No| G["Duty officer decides"]
     G --> F
@@ -28,52 +28,25 @@ interpreted against a changing incident history.
 
 ## Target AWS architecture
 
-This second view is the stack at a glance. It assumes AWS and Bedrock are
-accredited for the mailbox's information classification.
-
-```mermaid
-flowchart LR
-    Mailbox["Duty mailbox"] --> Intake["Durable intake<br/>S3 archive + SQS queue"]
-    Intake --> Parser["Deterministic<br/>parser"]
-    Parser --> Extractor["Bedrock<br/>extractor"]
-    Extractor --> Validator["Validation:<br/>schema, evidence,<br/>idempotency"]
-    Validator -->|"Accepted<br/>(provisional)"| Store[("Record store<br/>RDS PostgreSQL")]
-    Validator -->|"Needs review"| Review["Duty-officer<br/>review"]
-    Review -->|"Approved or<br/>corrected"| Store
-    Extractor -. "reads the existing<br/>picture (read-only)" .-> Store
-```
-
-The intake stores the exact email in S3 before publishing its reference;
-retries and replay cannot duplicate a source message or the same version of
-derived output, and exhausted retries park on a dead-letter queue.
-
-Accepted extractions are recorded as provisional immediately, avoiding
-human bottlenecks on fast-path data. Only extractions flagged for review
-route through duty-officer approval; both paths write with audit trails
-that distinguish provisional from validated assertions.
-
-### Model selection
-
-The extractor uses Claude 3.5 Sonnet via Amazon Bedrock in the London
-region. Claude is chosen for reasoning capability, instruction-following,
-structured output and bounded tool use. Sonnet balances accuracy, latency
-and cost, and is available in the required region. Bedrock Guardrails
-filter untrusted input and token/retry limits bound inference.
-
-The third view shows how authority is controlled inside that stack. Solid
-arrows move work or write records; dashed arrows are the agent's bounded,
-read-only search path.
+This is the future live topology, subject to accreditation for the mailbox's
+information classification. The roadmap below deliberately defers its intake.
 
 ```mermaid
 flowchart TB
-    subgraph Processing["Processing service"]
-        Parser["Deterministic<br/>message_parser"] --> Extractor["incident_extractor<br/>AgentCore Runtime + Bedrock"]
-        Extractor --> Validator["Validate schema, evidence,<br/>IDs and idempotency"]
+    subgraph Intake["Future live intake"]
+        Mailbox["Duty mailbox"] --> Capture["Mailbox connector"]
+        Capture --> Archive[("S3<br/>immutable original email")]
+        Archive --> Queue["SQS<br/>work item: S3 reference"]
+        Queue --> Worker["Lambda<br/>resolution worker"]
+        Queue -->|"after retry limit"| Dlq["SQS<br/>dead-letter queue"]
     end
 
-    subgraph Discovery["Read-only discovery boundary"]
-        Gateway["AgentCore Gateway<br/>allow-listed MCP tools"]
-        Query["Reference and incident<br/>query service"]
+    subgraph Processing["Bounded two-pass resolution"]
+        Worker --> Parser["Deterministic<br/>message_parser"]
+        Parser --> Clues["Bedrock Converse + Guardrail call 1<br/>evidence-backed search clues"]
+        Clues --> Candidates["Application candidate finder<br/>governed references + fixed queries"]
+        Candidates --> Match["Bedrock Converse + Guardrail call 2<br/>existing / new / links / review"]
+        Match --> Validator["Contract checks<br/>spans, candidate IDs, registry,<br/>idempotency"]
     end
 
     subgraph Authority["Authoritative records and review"]
@@ -82,125 +55,120 @@ flowchart TB
         Review["Duty-officer<br/>review workflow"]
     end
 
-    Extractor -. "read-only tool calls" .-> Gateway
-    Gateway -. "approved query shapes" .-> Query
-    Query -. "read-only" .-> Database
-    Validator -->|"accepted"| Writer
-    Validator -->|"needs review"| Review
+    Database -. "bounded read-only candidates" .-> Candidates
+    Validator -->|"policy-eligible"| Writer
+    Validator -->|"ambiguous or high-impact"| Review
     Review -->|"approved or corrected"| Writer
     Writer --> Database
 ```
 
-### Security boundary
+Fixed read-only queries supply bounded candidates. Neither model call
+has database credentials or arbitrary-query access.
 
-- **Framework.** This architecture is designed against the OWASP Top 10 for LLM
-  Applications.
-- **Bounded read-only access for the model.** The extractor reads only through the
-  AgentCore Gateway's allow-listed, read-only MCP tools, with no direct database
-  credentials, write access, or arbitrary-query capability. The query service
-  restricts scope and result size.
-- **Encryption and secrets.** KMS customer-managed keys protect S3 and RDS at
-  rest; VPC endpoints keep Bedrock/S3/RDS traffic off the public internet;
-  RDS credentials live in Secrets Manager, not in code or logs.
-- **Untrusted input.** Email text is untrusted. Bedrock Guardrails filter the
-  extractor's input and output, and limits on tool calls, time and tokens
-  bound the model.
-- **Authority and audit.** Only application-owned validation and write
-  services create records or route reviewed corrections. Audit data records
-  message, model, prompt, tool and reference-data versions.
-- **Data residency.** Bedrock, S3 and RDS run in the AWS London region,
-  keeping personal and OFFICIAL-SENSITIVE data in the UK and avoiding UK
-  GDPR international-transfer questions; the chosen Bedrock model must be
-  available there.
+Encrypted S3 preserves exact email evidence before queuing. Database uniqueness
+on source-message identity and derivation version makes concurrent retries/replay
+no-ops.
+
+Call 1 returns cited mentions, type and time clues—not canonical IDs.
+Application code resolves zero or many governed candidates and runs a broad,
+size-limited incident search.
+
+An empty narrow search is not proof of a new incident. Call 2 compares the
+evidence with the candidates and returns `existing`, `new` or `needs_review`,
+plus typed links to other incidents.
+
+Application code checks cited spans exist, selected IDs were retrieved and the
+registry permits proposed types, predicates and links.
+
+Each Bedrock Converse call applies a versioned Guardrail to extracted untrusted
+email, attachment and retrieved text, plus model output. Inputs use
+`guardContent`; blocks enter review.
+
+Neither checks nor Guardrails prove a semantic match. IAM and fixed read-only
+queries enforce authority; uncertain or high-impact decisions enter review.
+
+Only the writer has database write credentials. An append-only decision audit
+records caller, source spans, candidates, model/prompt/Guardrail/schema/registry
+versions, authorisation, validation, blocks and review outcomes.
+
+Configured CloudTrail trails record management and required data events.
+Bedrock invocation logs, where classification permits, use encrypted,
+access-restricted sinks and controlled retention.
 
 ## Generalising beyond Part A
 
-Part A fixes entity, incident and numeric-predicate vocabularies, then applies
-line-based rules over a single email body. Three axes generalise it.
+Part A uses fixed vocabularies and line rules. The target keeps a stable core:
+canonical entities and aliases, immutable assertions, typed links and reviews.
 
-### Interpreting incidents, locations and facts
+| Part A compromise | Production response |
+|---|---|
+| Closed types, aliases and predicates | A versioned registry defines entities, relationships and metrics with datatype, unit, scope, modality and time. Owners govern sources, licences, aliases, merges and effective dates. |
+| One positional incident and unanchored measurements | Incident assignment becomes evidence-backed, many-to-many and hierarchical, with provisional states and typed `caused_by`/`contributes_to`/`related_to` links. Unresolved measurements retain evidence and enter review. |
+| Body-only, line-based extraction | Layout, quoted/forwarded, table, attachment and relative-time processors share one assertion contract. Parent part, claim author, forwarding sender, source span and original time phrase survive; gaps remain typed issues. |
+| Fixed organisation roles and no site lifecycle | Roles, actions and lifecycle changes are time-bound, message-attributed assertions. Sites can change role; roads can resolve to segments. |
+| Resends and duplicate representations | Source-message idempotency stays separate from semantic message and assertion grouping, preserving evidence without double-counting. |
 
-The single top-to-bottom, one-current-incident pass becomes an agent that
-searches bounded context and returns an existing incident, a new one, a
-typed `caused_by`/`contributes_to`/`related_to` link, or a review case,
-supporting provisional, hierarchical and many-to-many incidents. Layout,
-quoted/forwarded, table, attachment and relative-time processors share one
-assertion contract, so parent part, claim author, forwarding sender, source
-span and original time phrase all survive; gaps remain typed issues.
+A new type normally needs a steward-approved registry change, reference mapping
+and labelled examples. The resolver reads the active catalogue at runtime;
+pipeline changes or retraining are normally unnecessary.
 
-### Growing the reference data
+Each version must pass replay. New structure or access rules still require a
+migration. The resolver may propose but cannot publish entries.
 
-Locations, sites, organisations and predicates stop being a hand-seeded,
-closed list. A versioned domain registry defines entity and relationship
-types, allowed endpoints and metrics: datatype, unit, population, geography,
-time. Within a type, the agent resolves each mention against the registry
-via bounded search and proposes a new entity or alias when no match clears
-its confidence threshold; a steward publishes it. A new type is the rarer,
-steward-led registry change, replay-evaluated before promotion.
+Sensitive, urgent, materially conflicting or ambiguous candidates enter review
+under classification-specific access and retention.
 
-For locations and sites, a candidate is cross-checked against an
-authoritative public gazetteer, such as OS Names, before it reaches steward
-review, so a new entity is grounded in a real place, not model confidence
-alone.
+Corrections never overwrite. Raw wording and scope survive beside comparable
+unit, population, geography and effective-time fields. Assertions link as
+`qualifies`, `supersedes` or `contradicts`, retaining both evidence spans.
 
-### What Part A does not attempt
-
-Corrections never overwrite: assertions link as `qualifies`, `supersedes` or
-`contradicts`, keeping both evidence spans when messages conflict.
-Organisation roles and site lifecycle become time-bound, message-attributed
-assertions instead of fixed facts. Resends stay idempotent at the message
-level, separate from semantic assertion grouping, so evidence survives
-without double-counting. A message referencing an attachment never received
-becomes a typed issue, not a fabricated or silently dropped claim. A versioned "current picture" view applies
-duty-officer-approved rules and shows competing reports when those rules
-cannot support one answer; sensitive or ambiguous candidates route to
-review.
+A versioned “current picture” view applies duty-officer-approved temporal,
+spatial, source and review rules. It shows competing reports when those rules
+cannot support one answer.
 
 ## Proving it is trustworthy
 
-Three loops run continuously, not once before launch.
+Historical mail and officer spreadsheets form widening backfill windows. Each
+new window is held out; every model, prompt, Guardrail, schema, registry or
+retrieval change replays prior windows.
 
-**Golden-set evaluation.** A labelled set of emails, covering body, table and
-attachment formats, relative time, corrections, similar names, multiple
-incidents and hostile text, is replayed against every model, prompt, tool or
-reference-data change. AgentCore evals measure precision, recall, merges/splits
-and abstention per release; regressions block promotion. Duty officers adjudicate
-disagreement rather than resolving it away.
+Execution traces of both calls, retrieval and validation are emitted through
+OpenTelemetry to AgentCore Evaluations.
 
-**Phased historical backfill.** Real historical emails are loaded in widening
-volume, one month, then three, then six, with duty officers manually
-reviewing every extraction before the next stage. Corrections drive schema
-and prompt changes, and feed the golden set itself.
+Code evaluators score contracts and candidate coverage; an LLM judge assesses
+evidence grounding. Officer adjudication remains the quality gate.
 
-**Security testing.** Extraction is tested for prompt injection from email body,
-sensitive-data leakage through tool calls, and excessive agency. No injection
-or out-of-scope read may succeed.
+Because spreadsheets hold conclusions and are overwritten, officers adjudicate
+a smaller evidence-spanned set. Disagreement triggers review, not an assumed
+model defect.
+
+| Stage | Evidence of quality |
+|---|---|
+| Backfill window | Measure clue/span accuracy, candidate coverage, existing/new/link precision and recall, facts/time/contradictions, false merges/splits and abstention. |
+| Security | Attack-test bodies, quotes, attachments and retrieval; verify Guardrail routing, query bounds, audit completeness and no unauthorised read/write. |
+| Controlled replay | Officers adjudicate every proposal; disagreement enters review, with no operational changes. |
+| Eventual live use | Track corrections, abstention, time saved, backlog, drift by sender/template, latency and cost. |
 
 Duty officers set numeric targets before a pilot. Hard gates include correct
-attribution, zero false merges in the agreed high-severity set, and
-precision over recall on numeric facts. Model confidence alone is not an
-acceptance gate.
+attribution and zero false merges in the agreed high-severity evaluation set.
+
+Numeric facts favour precision over recall. No adversarial test may cause an
+out-of-scope read or write.
+
+Model confidence alone is not an acceptance gate.
 
 ## First six weeks and deliberate omission
 
 | Period | Outcome |
 |---|---|
-| Week 1 | A user researcher and engineer shadow email triage, spreadsheet updates and handovers. They identify priority questions, incident-linking decisions and costly errors. |
-| Week 2 | Establish a versioned relational design for evidence, domain registries, entities, immutable assertions, typed links, review and idempotency. Validate it with officers' priority queries. |
-| Weeks 3–4 | Build the read-only query tools, AgentCore extractor, deterministic validation and minimal review workflow. Use controlled replay, not the live mailbox. |
-| Weeks 5–6 | Evaluate with duty officers, improve schema and prompts, calibrate abstention, test security and recovery, and decide what is safe to pilot next. |
+| Week 1 | A researcher and engineer shadow triage, spreadsheet updates and handovers, identifying priority questions, linking decisions and costly errors. |
+| Week 2 | Establish and validate with officers a versioned relational design for evidence, registries, entities, assertions, links, review and idempotency. |
+| Weeks 3–4 | Build the two-pass Bedrock resolver, candidate finder, checks, replay and minimal review. Use controlled emails, not the live mailbox. |
+| Weeks 5–6 | Evaluate with officers, improve schema/prompts, calibrate abstention, test security/recovery and decide what is safe to pilot. |
 
-**Deliberately not built:**
+**Deliberately not built:** live mailbox and SQS-driven ingestion. Controlled
+replay tests incident identity and relationships without operational risk.
 
-1. **Live mailbox and SQS-driven ingestion.** Demonstrating real-time flow adds
-operational risk without testing the hard problem: reliable incident identity
-and relationship discovery. S3 and SQS remain in the target architecture; live
-integration follows only when controlled replay demonstrates acceptable quality,
-review behaviour, data handling and recovery.
-
-2. **Live AgentCore Gateway MCP tool servers.** MCP server deployment requires
-internal governance approval and cross-functional sign-off in a regulated
-environment, making it infeasible within six weeks. Controlled replay with mock
-tool responses substitutes for live MCP during initial evaluation. Live MCP
-integration follows once governance review completes and controlled replay
-demonstrates acceptable quality.
+S3 and SQS remain the target; live integration follows after quality, review,
+data-handling and recovery gates. AgentCore Gateway/MCP waits for a second
+approved consumer needing a shared interface.
